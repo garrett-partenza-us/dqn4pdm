@@ -11,7 +11,6 @@ from tqdm import tqdm
 from collections import deque
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
-import typing
 from numpy.random import default_rng
 import argparse
 
@@ -26,7 +25,7 @@ parser.add_argument('--episodes', type=int, help='number of epsisodes to train',
 parser.add_argument('--trainsteps', type=int, help='training step interval', default=4)
 parser.add_argument('--updatesteps', type=int, help='target update step interval', default=10000)
 parser.add_argument('--batchsize', type=int, help='number of experiences to sample from memory', default=64)
-parser.add_argument('--alpha', type=float, help='alpha to use for prioritized experience replay', default=64)
+
 
 #tell user if GPU is available
 print("GPU available : {}".format(torch.cuda.is_available()))
@@ -81,96 +80,23 @@ class Transition():
         self.term = term
 
         
-#prioritized replay memory class
-class PrioritizedReplayMemory:
-    """Fixed-size buffer to store priority, Experience tuples."""
+#vanilla replay memory
+class ReplayMemory():
 
-    def __init__(self,
-                 batch_size: int,
-                 buffer_size: int,
-                 alpha: float = 0.0,
-                 random_state: np.random.RandomState = None) -> None:
-        """
-        Initialize an ExperienceReplayBuffer object.
+    def __init__(self, capacity):
+        self.memory = deque([], maxlen=capacity)
 
-        Parameters:
-        -----------
-        buffer_size (int): maximum size of buffer
-        batch_size (int): size of each training batch
-        alpha (float): Strength of prioritized sampling. Default to 0.0 (i.e., uniform sampling).
-        random_state (np.random.RandomState): random number generator.
-        
-        """
-        self._batch_size = batch_size
-        self._buffer_size = buffer_size
-        self._buffer_length = 0 # current number of prioritized experience tuples in buffer
-        self._buffer = np.empty(self._buffer_size, dtype=[("priority", np.float32), ("transition", Transition)])
-        self._alpha = alpha
-        self._random_state = np.random.RandomState() if random_state is None else random_state
-        
-    def __len__(self) -> int:
-        """Current number of prioritized experience tuple stored in buffer."""
-        return self._buffer_length
+    def push(self, *args):
+        self.memory.append(Transition(*args))
 
-    @property
-    def alpha(self):
-        """Strength of prioritized sampling."""
-        return self._alpha
+    def sample(self, batch_size):
+        return random.sample(self.memory, batch_size)
 
-    @property
-    def batch_size(self) -> int:
-        """Number of experience samples per training batch."""
-        return self._batch_size
+    def __len__(self):
+        return len(self.memory)
     
-    @property
-    def buffer_size(self) -> int:
-        """Maximum number of prioritized experience tuples stored in buffer."""
-        return self._buffer_size
-
-    def add(self, transition: Transition) -> None:
-        """Add a new experience to memory."""
-        priority = 1.0 if self.is_empty() else self._buffer["priority"].max()
-        if self.is_full():
-            if priority > self._buffer["priority"].min():
-                idx = self._buffer["priority"].argmin()
-                self._buffer[idx] = (priority, transition)
-            else:
-                pass # low priority experiences should not be included in buffer
-        else:
-            self._buffer[self._buffer_length] = (priority, transition)
-            self._buffer_length += 1
-
-    def is_empty(self) -> bool:
-        """True if the buffer is empty; False otherwise."""
-        return self._buffer_length == 0
     
-    def is_full(self) -> bool:
-        """True if the buffer is full; False otherwise."""
-        return self._buffer_length == self._buffer_size
-    
-    def sample(self, beta: float) -> typing.Tuple[np.array, np.array, np.array]:
-        """Sample a batch of experiences from memory."""
-        # use sampling scheme to determine which experiences to use for learning
-        ps = self._buffer[:self._buffer_length]["priority"]
-        sampling_probs = ps**self._alpha / np.sum(ps**self._alpha)
-        idxs = self._random_state.choice(np.arange(ps.size),
-                                         size=self._batch_size,
-                                         replace=True,
-                                         p=sampling_probs)
-        
-        # select the experiences and compute sampling weights
-        transitions = self._buffer["transition"][idxs]        
-        weights = (self._buffer_length * sampling_probs[idxs])**-beta
-        normalized_weights = weights / weights.max()
-        
-        return idxs, transitions, normalized_weights
-
-    def update_priorities(self, idxs: np.array, priorities: np.array) -> None:
-        """Update the priorities associated with particular experiences."""
-        self._buffer["priority"][idxs] = priorities
-
-        
-#dqn model class
+#vanilla double dqn model class
 class DQN(nn.Module):
     def __init__(self):
         super(DQN, self).__init__()
@@ -183,7 +109,8 @@ class DQN(nn.Module):
         x = self.lin2(x)
         return x
     
-#get action given net, state, and probability of random action
+    
+#get action given model, state, and probability of random choice
 def get_action(net, state, epsilon):
     with torch.no_grad():
         greedy = np.random.choice([True, False], p=[1-epsilon, epsilon])
@@ -196,10 +123,10 @@ def get_action(net, state, epsilon):
         return action
     
     
-#agent class
+#agent class to store hyperparamters, nets, and replay memory
 class Agent():
     
-    def __init__(self, episodes=5000, trainsteps=4, updatesteps=10000, batchsize=64, alpha=0.5):
+    def __init__(self, episodes=5000, trainsteps=4, updatesteps=10000, batchsize=64):
         
         #hyperparameters
         self.exp_replay_size = 100000
@@ -215,8 +142,6 @@ class Agent():
         self.loss_func = nn.MSELoss()
         self.optimizer_steps = 0
         self.optimizer_events = []
-        self.alpha = alpha
-        self.episode_count=0
         
         #networks
         self.QNet = DQN()
@@ -224,19 +149,15 @@ class Agent():
         self.optimizer = torch.optim.Adam(self.QNet.parameters(), lr=self.lr)
         
         #replay buffer
-        self.ER = PrioritizedReplayMemory(
-            batch_size = self.batch_size,
-            buffer_size = self.exp_replay_size,
-            alpha = self.alpha
-        )
+        self.ER = ReplayMemory(self.exp_replay_size)
         
-
-#optimize function
+        
+#optimizer function
 def optimize(agent):
-        
+    
     agent.optimizer_steps+=1
-    idxs, sample_transitions, sampling_weights = agent.ER.sample(beta=1-np.exp(-agent.lr*agent.episode_count))
-                        
+    sample_transitions = agent.ER.sample(agent.batch_size)
+            
     #get batch information
     state_batch = [transition.state for transition in sample_transitions]
     action_batch = [transition.action for transition in sample_transitions]
@@ -261,43 +182,36 @@ def optimize(agent):
         
     target_values = agent.gamma * target_values + torch.tensor(reward_batch, dtype=torch.float32, requires_grad=True)
     
-    deltas = torch.subtract(policy_values, target_values)
-    
-    priorities = (deltas.abs().cpu().detach().numpy().flatten())
-    
-    agent.ER.update_priorities(idxs, priorities + 1e-5) #priorities must be positive
-    
-    _sampling_weights = (torch.Tensor(sampling_weights).view((-1, 1)))
-    
-    loss = torch.mean((deltas * _sampling_weights)**2)
-    
-    return loss
+    return agent.loss_func(policy_values, target_values)
 
 
-#main
-def main(episodes, trainsteps, updatesteps, batchsize, alpha):
+def main(episodes, trainsteps, updatesteps, batchsize):
     
-    agent = Agent(episodes, trainsteps, updatesteps, batchsize, alpha)
+    #declare agent
+    agent = Agent(episodes, trainsteps, updatesteps, batchsize)
+
+    #set QNet to train mode
     agent.QNet.train()
-    losses = []
-    cummulative_rewards = []
-    epsilons = []
 
+    #good metrics to track
+    losses, cummulative_rewards, epsilons = [], [], []
+
+    #begin training loop
     for episode in tqdm(range(agent.num_episodes)):
 
+        #reinitialize an environment
         environment = Environment()
         cummulative_reward = 0
 
         while True:
 
-            agent.episode_count+=1
-
             #observation
             state = environment.get_state()
             action = get_action(agent.QNet, state, agent.epsilon)
             state_new, reward, terminated = environment.take_action(action)
+
             #append to replay buffer
-            agent.ER.add(Transition(state, action, state_new, reward, terminated))
+            agent.ER.push(state, action, state_new, reward, terminated)
 
             #update variables
             cummulative_reward+=reward
@@ -311,8 +225,8 @@ def main(episodes, trainsteps, updatesteps, batchsize, alpha):
                 loss = optimize(agent)
                 loss.backward()
                 agent.optimizer.step()
-                epsilons.append(agent.epsilon)
                 agent.epsilon=max(0, agent.epsilon-agent.eps_decay)
+                epsilons.append(agent.epsilon)
                 losses.append(loss.item())
 
             #copy weights to target network after every 'target_update_steps' updates
@@ -324,14 +238,15 @@ def main(episodes, trainsteps, updatesteps, batchsize, alpha):
             if terminated:
                 break
 
+        #track episodes cummulative reward
         cummulative_rewards.append(cummulative_reward)
-        
-        
+
+
     #save relevant information for presentation and paper
-    np.save('DDQN-PER/losses.npy', np.array(losses))
-    np.save('DDQN-PER/rewards.npy', np.array(cummulative_rewards))
-    np.save('DDQN-PER/epsilons.npy', np.array(epsilons))
-    torch.save(agent.QNet.state_dict(), 'DDQN-PER/model.pt')
+    np.save('DDQN-VAN/losses.npy', np.array(losses))
+    np.save('DDQN-VAN/rewards.npy', np.array(cummulative_rewards))
+    np.save('DDQN-VAN/epsilons.npy', np.array(epsilons))
+    torch.save(agent.QNet.state_dict(), 'DDQN-VAN/model.pt')
 
     #plot performance report
 
@@ -382,7 +297,7 @@ def main(episodes, trainsteps, updatesteps, batchsize, alpha):
 
     #show figure
     plt.legend()
-    plt.savefig('DDQN-PER/report.png')
+    plt.savefig('DDQN-VAN/report.png')
 
     #plot suggested replacement times for training trajectories
     df = pd.read_csv('train.csv')
@@ -425,7 +340,7 @@ def main(episodes, trainsteps, updatesteps, batchsize, alpha):
             axs[row,col].title.set_text('Engine {}'.format(engine_id))
 
     #show figure
-    plt.savefig('DDQN-PER/train_replacements.png')
+    plt.savefig('DDQN-VAN/train_replacements.png')
 
     #plot suggested replacement times for test trajectories
     df = pd.read_csv('test.csv')
@@ -470,16 +385,10 @@ def main(episodes, trainsteps, updatesteps, batchsize, alpha):
             axs[row,col].title.set_text('Engine {}'.format(engine_id))
 
     #show figure
-    plt.savefig('DDQN-PER/test_replacements.png')
+    plt.savefig('DDQN-VAN/test_replacements.png')
     
 
 if __name__=='__main__':
     #parse arguments
     args = parser.parse_args()
-    main(
-        episodes=args.episodes,
-        trainsteps=args.trainsteps,
-        updatesteps=args.updatesteps,
-        batchsize=args.batchsize,
-        alpha=args.alpha
-    )
+    main(episodes=args.episodes, trainsteps=args.trainsteps, updatesteps=args.updatesteps, batchsize=args.batchsize)
