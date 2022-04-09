@@ -42,7 +42,7 @@ class Environment():
         if action == 0:
             #failure occurs
             if self.cycle+1 == self.episode.size:
-                res = (None, -1, True)
+                res = (None, -76.87359945935496, True)
             #continued operation, return 1 and continue episode
             else:
                 res = (self.episode[self.cycle+1], self.episode[self.cycle], False)
@@ -152,8 +152,8 @@ class PrioritizedReplayMemory:
 class DQN(nn.Module):
     def __init__(self):
         super(DQN, self).__init__()
-        self.lin1 = nn.Linear(1,2)
-        self.lin2 = nn.Linear(2,2)
+        self.lin1 = nn.Linear(1,5)
+        self.lin2 = nn.Linear(5,2)
 
     def forward(self, x):
         x = self.lin1(x)
