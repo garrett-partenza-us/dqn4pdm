@@ -26,7 +26,7 @@ parser.add_argument('--episodes', type=int, help='number of epsisodes to train',
 parser.add_argument('--trainsteps', type=int, help='training step interval', default=4)
 parser.add_argument('--updatesteps', type=int, help='target update step interval', default=10000)
 parser.add_argument('--batchsize', type=int, help='number of experiences to sample from memory', default=64)
-parser.add_argument('--alpha', type=float, help='alpha to use for prioritized experience replay', default=64)
+parser.add_argument('--alpha', type=float, help='alpha to use for prioritized experience replay', default=0.5)
 
 #tell user if GPU is available
 print("GPU available : {}".format(torch.cuda.is_available()))
@@ -39,7 +39,7 @@ class Environment():
     def __init__(self):
         self.dataset = pd.read_csv('train.csv')
         self.episode = self.get_trajectory(np.random.randint(low=1, high=79, size=1))
-        self.cycle = 0
+        self.cycle = np.random.randint(0,len(self.episode),1).item()
         
     #get random trajectory
     def get_trajectory(self, engine_id):
