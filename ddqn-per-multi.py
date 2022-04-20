@@ -39,7 +39,7 @@ class Engine():
         self.dataset = dataset
         self.service = True
         self.episode = self.get_trajectory(np.random.randint(low=1, high=79, size=1))
-        self.cycle = np.random.randint(0,len(self.episode),1).item()
+        self.cycle = 0
 
     #get random trajectory
     def get_trajectory(self, engine_id):
@@ -54,15 +54,15 @@ class Engine():
         if action == 0:
             #failure occurs
             if self.cycle+1 == self.episode.size:
-                res = (None, -78)
+                res = (None, -75)
                 self.service = False
             #continued operation, return 1 and continue episode
             else:
                 res = (self.episode[self.cycle+1], self.episode[self.cycle])
                 self.cycle+=1
         elif action == 1:
-            self.cycle=0+int(np.random.uniform(0,50))
-            res = (self.episode[self.cycle], -self.episode[self.cycle])
+            self.cycle=0+int(np.random.uniform(0,20))
+            res = (self.episode[self.cycle], 0)
         return res
     
 #environment class
@@ -75,7 +75,7 @@ class Environment():
         self.fleet = []
         for engine in range(fleet_size):
             self.fleet.append(Engine(self.dataset))
-        self.balance = 100
+        self.balance = 200
         self.repair_cost = 25
         
     def get_state(self):
@@ -89,7 +89,12 @@ class Environment():
             else:
                 healths.append(-1)
                 cycles.append(-1)
-        return np.array([self.balance]+cycles+healths).flatten()
+        #format [h, c, h, c ... balance]
+        state = []
+        for pair in [[health, cycle] for health, cycle in zip(healths, cycles)]:
+            state+=pair
+        state+=[self.balance]
+        return np.array(state).flatten()
         
     def take_action(self, actions):
         #initialize reward as zero
@@ -101,9 +106,6 @@ class Environment():
                 if engine.service:
                     _, r = engine.step(action)
                     reward.append(r)
-                    # if engine.service:
-                    #     self.balance+=0.1
-                    #     pass
                 else:
                     reward.append(0)
             #replace
@@ -115,12 +117,14 @@ class Environment():
                         _, r = engine.step(action)
                         reward.append(r)
                     else:
-                        reward.append(-10)
+                        reward.append(0)
                 #penalize if not enough money
                 else:
-                    reward.append(-10)
                     if engine.service:
-                        engine.step(0)
+                        _, r = engine.step(0)
+                        reward.append(r)
+                    else:
+                        reward.append(0)
         #return reward and terminal flag
         if np.all([engine.service==False for engine in self.fleet]):
             return reward, True
@@ -229,23 +233,50 @@ class PrioritizedReplayMemory:
     
 #dqn model class
 class DQN(nn.Module):
-    def __init__(self, input_dim, output_dim):
+    def __init__(self, input_dim, n_actions):
         super(DQN, self).__init__()
-        self.lin1 = nn.Linear(input_dim,128)
-        self.lin2 = nn.Linear(128,256)
-        self.lin3 = nn.Linear(256,128)
-        self.lin4 = nn.Linear(128,output_dim)
-        self.dropout1 = nn.Dropout(0.2)
-        self.dropout2 = nn.Dropout(0.2)
+        
+        #passed variables
+        self.input_dim = input_dim
+        self.n_actions = n_actions
+        
+        #latent representation
+        self.latentrep = nn.Linear(input_dim,32)
+        self.dropout = nn.Dropout(0.5)
+        self.actionrep = nn.ModuleList([nn.Linear(32, 32) for i in range(n_actions)])
+        
+        #qvalue esimators 
+        self.advantages = nn.ModuleList([nn.Linear(32, 2) for i in range(n_actions)])
+        
+        #state representation
+        self.statevalue = nn.Linear(32,1)
 
     def forward(self, x):
-        x = F.relu(self.lin1(x))
-        x = self.dropout1(x)
-        x = F.relu(self.lin2(x))
-        x = self.dropout2(x)
-        x = F.relu(self.lin3(x))
-        x = F.relu(self.lin4(x))
-        return x
+        
+        #cast into latent representation
+        x = nn.LeakyReLU()(self.latentrep(x))
+        
+        #get state value estimation
+        state_value_est = nn.LeakyReLU()(self.statevalue(x))
+        
+        #qvalue pairs
+        qvalue_pairs = [nn.LeakyReLU()(self.actionrep[idx](x)) for idx in range(self.n_actions)]
+        qvalue_pairs = [self.dropout(qvalue_pairs[idx]) for idx in range(self.n_actions)]
+        qvalue_pairs = [nn.LeakyReLU()(self.advantages[idx](qvalue_pairs[idx])) for idx in range(self.n_actions)]
+
+        qvalue_pairs = torch.cat(qvalue_pairs, dim=0).reshape(-1, self.n_actions*2)
+        #reshape to batch_size, n_actions, n_subactions
+        qvalue_pairs = qvalue_pairs.reshape(-1, self.n_actions, 2)
+        #aggregation method
+        qvalue_pairs = torch.add(
+            torch.sub(
+                qvalue_pairs,
+                torch.mean(qvalue_pairs, dim=1)[:,None]
+            ),
+            state_value_est.unsqueeze(1)
+        )
+                        
+        return qvalue_pairs
     
 
 #get action given net, state, and probability of random action
@@ -277,7 +308,7 @@ class Agent():
         self.train_step_count = trainsteps
         self.steps = 0
         self.lr = 0.01
-        self.eps_decay = 5e-8
+        self.eps_decay = 2e-8
         self.loss_func = nn.MSELoss()
         self.optimizer_steps = 0
         self.optimizer_events = []
@@ -286,8 +317,8 @@ class Agent():
         self.episode_count=0
         
         #networks
-        self.QNet = DQN(fleet_size*2+1, fleet_size*2)
-        self.TNet = DQN(fleet_size*2+1, fleet_size*2)
+        self.QNet = DQN(fleet_size*2+1, fleet_size)
+        self.TNet = DQN(fleet_size*2+1, fleet_size)
         self.optimizer = torch.optim.Adam(self.QNet.parameters(), lr=self.lr)
         
         #replay buffer
@@ -311,41 +342,52 @@ def optimize(agent):
     state_batch = [transition.state for transition in sample_transitions]
     action_batch = [transition.action for transition in sample_transitions]
     reward_batch = [transition.reward for transition in sample_transitions]
-    state_new = [transition.state_new for transition in sample_transitions]
+    state_new_batch = [transition.state_new for transition in sample_transitions]
     term_batch = [transition.term for transition in sample_transitions]
 
     state_tensor = torch.tensor(state_batch, dtype=torch.float32, requires_grad=True)
     state_tensor = state_tensor.reshape(agent.batch_size, -1)
     
-    policy_preds = agent.QNet(state_tensor).reshape(agent.batch_size,-1,2)
+    policy_preds = agent.QNet(state_tensor)
     policy_values = torch.stack([selector(qvalues, idx) for qvalues, idx in zip(policy_preds, action_batch)])
     
-    state_new_tensor = torch.tensor(state_batch, dtype=torch.float32, requires_grad=True)
-    state_new_tensor = torch.nan_to_num(state_new_tensor, nan=0.0)
+    state_new_tensor = torch.tensor(state_new_batch, dtype=torch.float32, requires_grad=True)
     state_new_tensor = state_new_tensor.reshape(agent.batch_size, -1)
-    target_values = agent.TNet(state_new_tensor).reshape(agent.batch_size,-1,2)
+    target_values = agent.TNet(state_new_tensor)
+
     target_values = torch.max(target_values, dim=2).values
-    
+
     for idx, is_term in enumerate(term_batch):
         if is_term:
             for engine in range(agent.fleet_size):
                 target_values[idx][engine]=0.0
-        
+                        
     reward_batch = torch.tensor(reward_batch, dtype=torch.float32, requires_grad=True)
-    target_values = agent.gamma * target_values + reward_batch
     
-    deltas = torch.sum(torch.abs(torch.subtract(policy_values, target_values)), dim=1)
+    #compute td-target
+    target_values = torch.add(torch.mul(agent.gamma, target_values), torch.sum(reward_batch, dim=0))
+
+    #makes sense to apply torch.abs, but paper says practical performance works better this way
+    deltas = torch.abs(torch.subtract(policy_values, target_values))
+                
+    #compute priorities as averaged td error across action dimensions
+    priorities = (torch.mean(deltas, dim=1).cpu().detach().numpy().flatten())
     
-    priorities = (deltas.abs().cpu().detach().numpy().flatten())
-                  
+    #update priorities
     agent.ER.update_priorities(idxs, priorities + 1e-5) #priorities must be positive
     
+    #get sampling weights
     _sampling_weights = (torch.Tensor(sampling_weights).view((-1, 1)))
-    
-    loss = torch.mean((deltas * _sampling_weights)**2)
-    
-    return loss
 
+    #compute loss as av
+    weighted_deltas = torch.mul(torch.square(deltas), _sampling_weights)
+    
+    #average across action dimensions
+    weighted_deltas_branch_avg = torch.mean(weighted_deltas, dim=1)
+    
+    weighted_deltas_avg = torch.mean(weighted_deltas_branch_avg)
+    
+    return weighted_deltas_avg
 
 #main
 def main(episodes, trainsteps, updatesteps, batchsize, alpha, fleet_size):

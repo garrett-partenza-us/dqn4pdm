@@ -39,7 +39,8 @@ class Environment():
     def __init__(self):
         self.dataset = pd.read_csv('train.csv')
         self.episode = self.get_trajectory(np.random.randint(low=1, high=79, size=1))
-        self.cycle = np.random.randint(0,len(self.episode),1).item()
+        self.cycle = 0
+        # self.cycle = np.random.randint(0,len(self.episode),1).item()
         
     #get random trajectory
     def get_trajectory(self, engine_id):

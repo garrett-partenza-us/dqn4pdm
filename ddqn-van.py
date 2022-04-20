@@ -162,7 +162,7 @@ def optimize(agent):
     state_batch = [transition.state for transition in sample_transitions]
     action_batch = [transition.action for transition in sample_transitions]
     reward_batch = [transition.reward for transition in sample_transitions]
-    state_new = [transition.state_new for transition in sample_transitions]
+    state_new_batch = [transition.state_new for transition in sample_transitions]
     term_batch = [transition.term for transition in sample_transitions]
 
     state_tensor = torch.tensor(state_batch, dtype=torch.float32, requires_grad=True)
@@ -170,15 +170,14 @@ def optimize(agent):
     
     policy_preds = agent.QNet(state_tensor)
     policy_values = torch.stack([qvalues[idx] for qvalues, idx in zip(policy_preds, map(int, action_batch))])
-    
-    state_new_tensor = torch.tensor(state_batch, dtype=torch.float32, requires_grad=True)
-    state_new_tensor = torch.nan_to_num(state_new_tensor, nan=0.0)
+
+    for idx, is_term in enumerate(term_batch):
+        state_new_batch[idx] = np.array([0.0, 0.0]) if is_term else state_new_batch[idx]
+        
+    state_new_tensor = torch.tensor(state_new_batch, dtype=torch.float32, requires_grad=True)
     state_new_tensor = state_new_tensor.reshape(agent.batch_size, -1)
     target_values = agent.TNet(state_new_tensor)
     target_values = torch.max(target_values, dim=1).values
-    
-    for idx, is_term in enumerate(term_batch):
-        target_values[idx] = 0.0 if is_term else target_values[idx]
         
     target_values = agent.gamma * target_values + torch.tensor(reward_batch, dtype=torch.float32, requires_grad=True)
     
